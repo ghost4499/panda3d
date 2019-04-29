@@ -237,6 +237,7 @@ public:
   };
 
   enum ShaderArgType {
+    SAT_unknown,
     SAT_scalar,
     SAT_vec1,
     SAT_vec2,
@@ -258,6 +259,7 @@ public:
     SAT_mat4x2,
     SAT_mat4x3,
     SAT_mat4x4,
+    SAT_sampler,
     SAT_sampler1d,
     SAT_sampler2d,
     SAT_sampler3d,
@@ -265,7 +267,6 @@ public:
     SAT_sampler_cube,
     SAT_sampler_buffer,
     SAT_sampler_cube_array,
-    SAT_unknown
 };
 
   enum ShaderArgDir {
@@ -530,6 +531,8 @@ public:
   static void set_default_caps(const ShaderCaps &caps);
 
 private:
+  bool spirv_analyze_shader(const std::string &data);
+
 #ifdef HAVE_CG
   ShaderArgClass cg_parameter_class(CGparameter p);
   ShaderArgType cg_parameter_type(CGparameter p);

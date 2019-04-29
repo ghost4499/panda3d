@@ -2614,6 +2614,27 @@ def SdkLocateAndroid():
 
         SDK["JDK"] = jdk_home
 
+def SdkLocateVulkan():
+    if GetHost() != 'windows' or GetTarget() != 'windows':
+        return
+
+    path = 'C:/VulkanSDK'
+    if os.path.isdir(path):
+        # Enumerate the available Vulkan SDK versions.
+        versions = []
+        for dir in os.listdir(path):
+            try:
+                versions.append(tuple([int(i) for i in dir.split('.')]))
+            except ValueError:
+                pass
+
+        # Use the latest version.
+        versions.sort()
+        version = '.'.join([str(i) for i in versions[-1]])
+
+        print("Using Vulkan SDK %s" % (version))
+        SDK["VULKAN"] = path + '/' + version
+
 ########################################################################
 ##
 ## SDK Auto-Disables

@@ -27,6 +27,9 @@
 #include <Cg/cg.h>
 #endif
 
+#include "spirv.h"
+#include <stdint.h>
+
 using std::istream;
 using std::move;
 using std::ostream;
@@ -2546,6 +2549,10 @@ load(const ShaderFile &sbody, BamCacheRecord *record) {
       shader_cat.error()
         << "GLSL shaders must have separate shader bodies!\n";
       return false;
+    } else if (_language == SL_SPIR_V) {
+      shader_cat.error()
+        << "SPIR-V shaders must have separate shader bodies!\n";
+      return false;
     }
 
     // Determine which language the shader is written in.
@@ -2660,6 +2667,10 @@ do_load_source(string &into, const std::string &source, BamCacheRecord *record) 
 
   } else {
     into = source;
+  }
+
+  if (_language == SL_SPIR_V) {
+    return spirv_analyze_shader(into);
   }
 
   // Strip trailing whitespace.
@@ -3095,6 +3106,240 @@ check_modified() const {
   return false;
 }
 
+/**
+ * Parses a SPIR-V shader to figure out which parameters it uses.
+ */
+bool Shader::
+spirv_analyze_shader(const string &data) {
+  //const string &data = get_text(type);
+  const uint32_t *words = (const uint32_t *)data.data();
+  const size_t length = data.size() >> 2;
+  const uint32_t *end = words + length;
+
+  if (length < 5) {
+    shader_cat.error()
+      << "Invalid SPIR-V file: too short.\n";
+    return false;
+  }
+
+  if (*words++ != SpvMagicNumber) {
+    shader_cat.error()
+      << "Invalid SPIR-V file: wrong magic number.\n";
+    return false;
+  }
+
+  ++words; // version
+  ++words; // generator
+  uint32_t bound = *words++;
+  ++words; // schema (reserved)
+
+  // Stores information on all of the types and variables encountered.
+  struct ShaderVar {
+    string _name;
+    ShaderArgType _type;
+    int _location;
+    int _set;
+  } def_var = {string(), SAT_unknown, -1, -1};
+
+  pvector<ShaderVar> vars(bound, def_var);
+
+  ShaderType shader_type = ST_none;
+
+  while (words < end) {
+    uint16_t wcount = words[0] >> SpvWordCountShift;
+    SpvOp opcode = (SpvOp)(words[0] & SpvOpCodeMask);
+
+    switch (opcode) {
+    case SpvOpMemoryModel:
+      nassertr(wcount == 3, false);
+      if (words[1] != SpvAddressingModelLogical) {
+        shader_cat.error()
+          << "Invalid SPIR-V shader: addressing model Logical must be used.\n";
+        return false;
+      }
+      if (words[2] != SpvMemoryModelGLSL450) {
+        shader_cat.error()
+          << "Invalid SPIR-V shader: memory model GLSL450 must be used.\n";
+        return false;
+      }
+      break;
+
+    case SpvOpEntryPoint:
+      switch ((SpvExecutionModel)words[1]) {
+      case SpvExecutionModelVertex:
+        shader_type = ST_vertex;
+        break;
+      case SpvExecutionModelTessellationControl:
+        shader_type = ST_tess_control;
+        break;
+      case SpvExecutionModelTessellationEvaluation:
+        shader_type = ST_tess_evaluation;
+        break;
+      case SpvExecutionModelGeometry:
+        shader_type = ST_geometry;
+        break;
+      case SpvExecutionModelFragment:
+        shader_type = ST_fragment;
+        break;
+      default:
+        break;
+      }
+      break;
+
+    case SpvOpName:
+      vars[words[1]]._name = string((const char *)&words[2]);
+      break;
+
+    case SpvOpTypeVoid:
+      vars[words[1]]._type = SAT_unknown;
+      break;
+
+    case SpvOpTypeFloat:
+      vars[words[1]]._type = SAT_scalar;
+      break;
+
+    case SpvOpTypeVector:
+      vars[words[1]]._type = (ShaderArgType)(SAT_vec1 + (words[3] - 1));
+      break;
+
+    case SpvOpTypeMatrix:
+      vars[words[1]]._type = (ShaderArgType)(SAT_mat1x1 + (words[3] - 1) * 5);
+      break;
+
+    case SpvOpTypePointer:
+      // A type and type pointer isn't the same, but this is how types of
+      // variables are referenced, and it's convenient to do this since
+      // the "Logical" address model doesn't support using pointers anyway.
+      vars[words[1]]._type = vars[words[3]]._type;
+      break;
+
+    case SpvOpTypeImage:
+      switch ((SpvDim)words[3]) {
+      case SpvDim1D:
+        vars[words[1]]._type = SAT_sampler1d;
+        break;
+      case SpvDim2D:
+        if (words[5]) {
+          vars[words[1]]._type = SAT_sampler2d_array;
+        } else {
+          vars[words[1]]._type = SAT_sampler2d;
+        }
+        break;
+      case SpvDim3D:
+        vars[words[1]]._type = SAT_sampler3d;
+        break;
+      case SpvDimCube:
+        if (words[5]) {
+          vars[words[1]]._type = SAT_sampler_cube_array;
+        } else {
+          vars[words[1]]._type = SAT_sampler_cube;
+        }
+        break;
+      case SpvDimRect:
+        shader_cat.error()
+          << "imageRect shader inputs are not supported.\n";
+        return false;
+      case SpvDimBuffer:
+        vars[words[1]]._type = SAT_sampler_buffer;
+        break;
+      case SpvDimSubpassData:
+        shader_cat.error()
+          << "subpassInput shader inputs are not supported.\n";
+        return false;
+      }
+      break;
+
+    case SpvOpTypeSampler:
+      // A sampler that's not bound to a particular image.
+      vars[words[1]]._type = SAT_sampler;
+      break;
+
+    case SpvOpTypeSampledImage:
+      // We don't currently distinguish between samplers and images.
+      vars[words[1]]._type = vars[words[2]]._type;
+      break;
+
+    case SpvOpVariable:
+      // A variable definition - check the storage class.
+      switch ((SpvStorageClass)words[3]) {
+      case SpvStorageClassUniformConstant:
+        {
+          if (vars[words[1]]._type < SAT_sampler1d) {
+            break;
+          }
+          const ShaderVar &var = vars[words[2]];
+          ShaderTexSpec spec;
+          spec._id._name = var._name;
+          spec._id._type = shader_type;
+          spec._id._seqno = var._location;
+          spec._part = STO_named_input;
+          spec._stage = -1;
+          spec._desired_type = -1;
+          _tex_spec.push_back(spec);
+        }
+        break;
+      case SpvStorageClassInput:
+        if (shader_type == ST_vertex) {
+          const ShaderVar &var = vars[words[2]];
+          if (var._name.empty()) {
+            shader_cat.error()
+              << "Shader vertex input requires a name.\n";
+            break;
+          }
+          if (var._location < 0) {
+            //TODO: just jam one in here somewhere?
+            shader_cat.error()
+              << "Shader vertex input requires location decoration.\n";
+            break;
+          }
+          ShaderVarSpec spec;
+          spec._id._name = var._name;
+          spec._id._type = shader_type;
+          spec._id._seqno = var._location;
+          spec._name = InternalName::make(var._name);
+          spec._append_uv = false;
+          spec._elements = 1;
+          spec._numeric_type = SPT_float;
+          _var_spec.push_back(spec);
+        }
+        break;
+      case SpvStorageClassUniform:
+      case SpvStorageClassOutput:
+      case SpvStorageClassWorkgroup:
+      case SpvStorageClassCrossWorkgroup:
+      case SpvStorageClassPrivate:
+      case SpvStorageClassFunction:
+      case SpvStorageClassGeneric:
+      case SpvStorageClassPushConstant:
+      case SpvStorageClassAtomicCounter:
+      case SpvStorageClassImage:
+        break;
+      }
+      break;
+
+    case SpvOpDecorate:
+      // Use the same field to store location/binding, since I don't believe
+      // that variables can specify both.
+      if (words[2] == SpvDecorationLocation || words[2] == SpvDecorationBinding) {
+        vars[words[1]]._location = words[3];
+      } else if (words[2] == SpvDecorationDescriptorSet) {
+        vars[words[1]]._set = words[3];
+      }
+      break;
+    }
+
+    words += wcount;
+  }
+
+  if (shader_type == ST_none) {
+    shader_cat.error()
+      << "No valid entry point found in SPIR-V shader.\n";
+    return false;
+  }
+
+  return true;
+}
+
 #ifdef HAVE_CG
 /**
  * Determines the appropriate active shader profile settings based on any
@@ -3524,7 +3769,7 @@ make(ShaderLanguage lang, string vertex, string fragment, string geometry,
  */
 PT(Shader) Shader::
 make_compute(ShaderLanguage lang, string body) {
-  if (lang != SL_GLSL) {
+  if (lang != SL_GLSL && lang != SL_SPIR_V) {
     shader_cat.error()
       << "Only GLSL compute shaders are currently supported.\n";
     return nullptr;
@@ -3548,6 +3793,14 @@ make_compute(ShaderLanguage lang, string body) {
   shader->_filename = ShaderFile("created-shader");
   if (!shader->load(sbody)) {
     return nullptr;
+  }
+
+  if (lang == SL_SPIR_V) {
+    if (!shader->spirv_analyze_shader(shader->_text._compute)) {
+      shader_cat.error()
+        << "Shader encountered an error.\n";
+      return nullptr;
+    }
   }
 
   if (cache_generated_shaders) {
